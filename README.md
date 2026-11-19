@@ -10,6 +10,9 @@ When AI engineers fine-tune local models in modern AI IDEs, data preparation is 
 - Inspecting schemas and field distributions
 - Stripping invisible control characters, AI preambles ("As an AI language model..."), and fixing broken markdown code fences
 - Performing deterministic train/val/test splits with reproducible seeds
+- Removing duplicates and near-duplicate records
+- Deterministic sampling for fast testing
+- Merging multiple disparate data sources into a single file
 - Converting between Alpaca, ShareGPT, and ChatML formats
 - Scoring datasets for PII, toxic keywords, and educational value
 
@@ -17,7 +20,7 @@ When AI engineers fine-tune local models in modern AI IDEs, data preparation is 
 
 ---
 
-## 🛠️ Available MCP Tools
+## Available MCP Tools (9 Core Tools)
 
 | Tool | Type | Description |
 | :--- | :--- | :--- |
@@ -25,12 +28,23 @@ When AI engineers fine-tune local models in modern AI IDEs, data preparation is 
 | `soup_detect_format` | Read-only | Detects schema format (`alpaca`, `sharegpt`, `chatml`, `dpo`, etc.) and column structure. |
 | `soup_score_dataset` | Read-only | Evaluates dataset for PII (emails/phones), toxic keywords, language distribution, and educational value. |
 | `soup_clean_dataset` | Safe Mutating | Sanitizes control characters, strips AI disclaimers, repairs unclosed markdown fences, and fixes JSON syntax. |
+| `soup_dedup_dataset` | Safe Mutating | Drops exact and field-level duplicates with preserved row order. |
+| `soup_sample_dataset` | Safe Mutating | Deterministic random subset sampling by count or percentage with seed. |
 | `soup_split_dataset` | Safe Mutating | Deterministic train/validation/test partitioning with reproducible pseudorandom seeds. |
 | `soup_convert_format` | Safe Mutating | Lossless format conversion between Alpaca, ShareGPT, and ChatML. |
+| `soup_merge_datasets` | Safe Mutating | Merges multiple JSONL dataset files into a single unified file. |
 
 ---
 
-## 🔒 Security Invariants
+## MCP Prompts (Built-in Workflow Recipes)
+
+`soup-mcp` includes interactive prompts that AI assistants can load:
+- **`audit_dataset`**: Guides the AI to run inspection, format detection, and scoring tools to generate an exhaustive dataset health report.
+- **`prepare_dataset`**: Guides the AI through the complete preparation recipe: inspection -> cleaning -> deduplication -> format conversion -> train/val splitting.
+
+---
+
+## Security Invariants
 
 `soup-mcp` adheres strictly to Soup's core security architecture:
 1. **Working Directory Containment:** All read and write operations are strictly bound to the operator's Current Working Directory (`CWD`). Any relative traversal (`../`) or absolute path escaping CWD is refused immediately.
@@ -40,12 +54,12 @@ When AI engineers fine-tune local models in modern AI IDEs, data preparation is 
 
 ---
 
-## 🚀 Quickstart & Client Setup
+## Quickstart & Client Setup
 
 ### 1. Installation
 
 ```bash
-git clone https://github.com/MakazhanAlpamys/Soup.git
+git clone https://github.com/Shubham-dev-stack/soup-mcp.git
 cd soup-mcp
 pip install -e .
 ```
@@ -90,7 +104,7 @@ pip install -e .
 
 ---
 
-## 🧪 Testing & Verification
+## Testing & Verification
 
 The test suite enforces 100% test pass rates and multi-item positive control verification:
 
@@ -98,9 +112,12 @@ The test suite enforces 100% test pass rates and multi-item positive control ver
 pytest -v
 ```
 
-All 47 tests pass covering:
+All 71 tests pass covering:
 - Format auto-detection & inspection across multi-row datasets
 - Cleaning rules (invisible control characters, zero-width spaces, AI disclaimers)
+- De-duplication and preserved item order
+- Sample partitioning with deterministic seeds
+- Multi-dataset file merging
 - Split boundary checks (percentage & absolute modes with seed reproducibility)
 - 1-to-1 message preservation during format conversion
 - Negative security controls (path traversal, parent symlinks, in-place overwrite prevention)

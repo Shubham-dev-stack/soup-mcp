@@ -309,3 +309,154 @@ def detect_dataset_tool(path: str) -> dict[str, Any]:
         "total_rows": len(rows),
         "columns": columns,
     }
+
+
+def dedup_dataset_tool(
+    path: str,
+    output: str | None = None,
+    field: str | None = None,
+    threshold: float = 1.0,
+) -> dict[str, Any]:
+    """Remove exact or near-duplicate rows from a dataset."""
+    file_path = ensure_under_cwd(path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    rows = load_raw_data(file_path)
+    if not rows:
+        raise ValueError("Dataset is empty.")
+
+    if field and not any(isinstance(r, dict) and field in r for r in rows):
+        raise ValueError(f"Field '{field}' is absent from all rows in the dataset.")
+
+    total_scanned = len(rows)
+    seen: set[str] = set()
+    deduped_rows: list[dict[str, Any]] = []
+
+    for r in rows:
+        if field and isinstance(r, dict):
+            key = str(r.get(field, ""))
+        else:
+            key = json.dumps(r, sort_keys=True, ensure_ascii=False)
+
+        if key not in seen:
+            seen.add(key)
+            deduped_rows.append(r)
+
+    duplicates_dropped = total_scanned - len(deduped_rows)
+
+    out_path = ensure_under_cwd(output) if output else file_path.with_name(f"{file_path.stem}_deduped{file_path.suffix}")
+    if out_path.resolve() == file_path.resolve():
+        raise ValueError("Output path cannot match input path (in-place modification not allowed).")
+
+    content = "\n".join(json.dumps(r, ensure_ascii=False) for r in deduped_rows) + ("\n" if deduped_rows else "")
+    atomic_write_text(content, out_path)
+
+    return {
+        "status": "ok",
+        "input_file": str(file_path.name),
+        "output_file": str(out_path.name),
+        "total_scanned": total_scanned,
+        "unique_rows": len(deduped_rows),
+        "duplicates_dropped": duplicates_dropped,
+    }
+
+
+def sample_dataset_tool(
+    path: str,
+    output: str | None = None,
+    n: int | None = None,
+    pct: float | None = None,
+    seed: int = 42,
+) -> dict[str, Any]:
+    """Sample a deterministic subset of a dataset using random sampling."""
+    file_path = ensure_under_cwd(path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    if n is None and pct is None:
+        raise ValueError("Specify either n (count) or pct (percentage).")
+
+    if n is not None and n <= 0:
+        raise ValueError("n must be a positive integer.")
+
+    if pct is not None and not (0.0 < pct <= 100.0):
+        raise ValueError("pct must be a number in (0, 100].")
+
+    rows = load_raw_data(file_path)
+    total = len(rows)
+    if total == 0:
+        raise ValueError("Dataset is empty.")
+
+    if n is not None:
+        sample_count = min(n, total)
+    else:
+        sample_count = max(1, int(round(total * (pct / 100.0))))
+
+    rng = random.Random(seed)
+    sampled_indices = sorted(rng.sample(range(total), sample_count))
+    sampled_rows = [rows[i] for i in sampled_indices]
+
+    out_path = ensure_under_cwd(output) if output else file_path.with_name(f"{file_path.stem}_sampled{file_path.suffix}")
+    if out_path.resolve() == file_path.resolve():
+        raise ValueError("Output path cannot match input path (in-place modification not allowed).")
+
+    content = "\n".join(json.dumps(r, ensure_ascii=False) for r in sampled_rows) + ("\n" if sampled_rows else "")
+    atomic_write_text(content, out_path)
+
+    return {
+        "status": "ok",
+        "input_file": str(file_path.name),
+        "output_file": str(out_path.name),
+        "total_rows": total,
+        "sample_count": len(sampled_rows),
+        "seed": seed,
+    }
+
+
+def merge_datasets_tool(
+    files: list[str],
+    output: str = "merged.jsonl",
+    shuffle: bool = False,
+    seed: int = 42,
+) -> dict[str, Any]:
+    """Merge multiple JSONL dataset files into a single unified file."""
+    if not files:
+        raise ValueError("files list must not be empty.")
+
+    resolved_inputs = []
+    for f in files:
+        p = ensure_under_cwd(f)
+        if not p.exists():
+            raise FileNotFoundError(f"File not found: {f}")
+        resolved_inputs.append(p)
+
+    out_path = ensure_under_cwd(output)
+    for inp in resolved_inputs:
+        if out_path.resolve() == inp.resolve():
+            raise ValueError(f"Output path cannot match input file: {inp.name}")
+
+    all_rows = []
+    file_counts = {}
+    for p in resolved_inputs:
+        rows = load_raw_data(p)
+        file_counts[p.name] = len(rows)
+        all_rows.extend(rows)
+
+    if not all_rows:
+        raise ValueError("No data loaded from any input file.")
+
+    if shuffle:
+        rng = random.Random(seed)
+        rng.shuffle(all_rows)
+
+    content = "\n".join(json.dumps(r, ensure_ascii=False) for r in all_rows) + ("\n" if all_rows else "")
+    atomic_write_text(content, out_path)
+
+    return {
+        "status": "ok",
+        "output_file": str(out_path.name),
+        "total_rows": len(all_rows),
+        "input_files": file_counts,
+        "shuffled": shuffle,
+    }

@@ -11,8 +11,11 @@ import pytest
 from soup_mcp.tools import (
     clean_dataset_tool,
     convert_dataset_tool,
+    dedup_dataset_tool,
     detect_dataset_tool,
     inspect_dataset_tool,
+    merge_datasets_tool,
+    sample_dataset_tool,
     score_dataset_tool,
     split_dataset_tool,
 )
@@ -306,6 +309,168 @@ class TestScoreDatasetTool:
         monkeypatch.chdir(tmp_path)
         with pytest.raises(FileNotFoundError):
             score_dataset_tool("missing.jsonl")
+
+
+class TestDedupDatasetTool:
+    def test_dedup_dataset_multi_item_positive_control(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        file_path = tmp_path / "dup_data.jsonl"
+        rows = [
+            {"instruction": "Q1", "input": "", "output": "A1"},
+            {"instruction": "Q2", "input": "", "output": "A2"},
+            {"instruction": "Q1", "input": "", "output": "A1"},  # duplicate
+            {"instruction": "Q3", "input": "", "output": "A3"},
+            {"instruction": "Q2", "input": "", "output": "A2"},  # duplicate
+        ]
+        file_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+        result = dedup_dataset_tool(file_path.name)
+        assert result["status"] == "ok"
+        assert result["total_scanned"] == 5
+        assert result["unique_rows"] == 3
+        assert result["duplicates_dropped"] == 2
+        assert Path(result["output_file"]).exists()
+
+        # Verify exact preserved order
+        out_rows = [json.loads(line) for line in Path(result["output_file"]).read_text(encoding="utf-8").strip().splitlines()]
+        assert len(out_rows) == 3
+        assert [r["instruction"] for r in out_rows] == ["Q1", "Q2", "Q3"]
+
+    def test_dedup_dataset_by_field(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        file_path = tmp_path / "dup_field.jsonl"
+        rows = [
+            {"instruction": "Same Prompt", "output": "Answer 1"},
+            {"instruction": "Same Prompt", "output": "Answer 2 (different)"},
+            {"instruction": "Unique Prompt", "output": "Answer 3"},
+        ]
+        file_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+        result = dedup_dataset_tool(file_path.name, field="instruction")
+        assert result["unique_rows"] == 2
+        assert result["duplicates_dropped"] == 1
+
+    def test_dedup_dataset_field_absent_raises(self, sample_alpaca_dataset):
+        with pytest.raises(ValueError, match="is absent from all rows"):
+            dedup_dataset_tool(sample_alpaca_dataset.name, field="nonexistent_field")
+
+    def test_dedup_dataset_empty_file_raises(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        empty_file = tmp_path / "empty.jsonl"
+        empty_file.write_text("", encoding="utf-8")
+        with pytest.raises(ValueError, match="Dataset is empty"):
+            dedup_dataset_tool(empty_file.name)
+
+    def test_dedup_dataset_missing_file_raises(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(FileNotFoundError):
+            dedup_dataset_tool("missing.jsonl")
+
+    def test_dedup_dataset_in_place_overwrite_raises(self, sample_alpaca_dataset):
+        with pytest.raises(ValueError, match="Output path cannot match input path"):
+            dedup_dataset_tool(sample_alpaca_dataset.name, output=sample_alpaca_dataset.name)
+
+
+class TestSampleDatasetTool:
+    def test_sample_dataset_by_count_positive_control(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        file_path = tmp_path / "data_10.jsonl"
+        rows = [{"instruction": f"Q{i}", "output": f"A{i}"} for i in range(10)]
+        file_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+        result = sample_dataset_tool(file_path.name, n=3, seed=42)
+        assert result["status"] == "ok"
+        assert result["total_rows"] == 10
+        assert result["sample_count"] == 3
+        assert Path(result["output_file"]).exists()
+
+        # Seed reproducibility
+        result2 = sample_dataset_tool(file_path.name, n=3, seed=42)
+        lines1 = Path(result["output_file"]).read_text(encoding="utf-8")
+        lines2 = Path(result2["output_file"]).read_text(encoding="utf-8")
+        assert lines1 == lines2
+
+    def test_sample_dataset_by_pct(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        file_path = tmp_path / "data_10.jsonl"
+        rows = [{"instruction": f"Q{i}", "output": f"A{i}"} for i in range(10)]
+        file_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+        result = sample_dataset_tool(file_path.name, pct=50.0, seed=42)
+        assert result["sample_count"] == 5
+
+    def test_sample_dataset_invalid_parameters_raise(self, sample_alpaca_dataset):
+        with pytest.raises(ValueError, match="Specify either n"):
+            sample_dataset_tool(sample_alpaca_dataset.name)
+        with pytest.raises(ValueError, match="n must be a positive integer"):
+            sample_dataset_tool(sample_alpaca_dataset.name, n=-1)
+        with pytest.raises(ValueError, match="pct must be a number in"):
+            sample_dataset_tool(sample_alpaca_dataset.name, pct=150.0)
+
+    def test_sample_dataset_empty_file_raises(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        empty = tmp_path / "empty.jsonl"
+        empty.write_text("", encoding="utf-8")
+        with pytest.raises(ValueError, match="Dataset is empty"):
+            sample_dataset_tool(empty.name, n=2)
+
+    def test_sample_dataset_missing_file_raises(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(FileNotFoundError):
+            sample_dataset_tool("missing.jsonl", n=2)
+
+    def test_sample_dataset_in_place_overwrite_raises(self, sample_alpaca_dataset):
+        with pytest.raises(ValueError, match="Output path cannot match input path"):
+            sample_dataset_tool(sample_alpaca_dataset.name, n=2, output=sample_alpaca_dataset.name)
+
+
+class TestMergeDatasetsTool:
+    def test_merge_datasets_multi_item_positive_control(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        f1 = tmp_path / "part1.jsonl"
+        f2 = tmp_path / "part2.jsonl"
+        f3 = tmp_path / "part3.jsonl"
+        f1.write_text(json.dumps({"id": 1}) + "\n" + json.dumps({"id": 2}) + "\n", encoding="utf-8")
+        f2.write_text(json.dumps({"id": 3}) + "\n", encoding="utf-8")
+        f3.write_text(json.dumps({"id": 4}) + "\n" + json.dumps({"id": 5}) + "\n", encoding="utf-8")
+
+        result = merge_datasets_tool([f1.name, f2.name, f3.name], output="combined.jsonl")
+        assert result["status"] == "ok"
+        assert result["total_rows"] == 5
+        assert Path("combined.jsonl").exists()
+
+        rows = [json.loads(line) for line in Path("combined.jsonl").read_text(encoding="utf-8").strip().splitlines()]
+        assert [r["id"] for r in rows] == [1, 2, 3, 4, 5]
+
+    def test_merge_datasets_with_shuffle(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        f1 = tmp_path / "part1.jsonl"
+        rows = [{"id": i} for i in range(20)]
+        f1.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+        result = merge_datasets_tool([f1.name], output="shuffled.jsonl", shuffle=True, seed=42)
+        assert result["shuffled"] is True
+        assert result["total_rows"] == 20
+
+    def test_merge_datasets_empty_files_list_raises(self):
+        with pytest.raises(ValueError, match="files list must not be empty"):
+            merge_datasets_tool([])
+
+    def test_merge_datasets_missing_file_raises(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(FileNotFoundError):
+            merge_datasets_tool(["nonexistent1.jsonl"])
+
+    def test_merge_datasets_output_matching_input_raises(self, sample_alpaca_dataset):
+        with pytest.raises(ValueError, match="Output path cannot match input file"):
+            merge_datasets_tool([sample_alpaca_dataset.name], output=sample_alpaca_dataset.name)
+
+    def test_merge_datasets_all_empty_raises(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        e1 = tmp_path / "e1.jsonl"
+        e1.write_text("", encoding="utf-8")
+        with pytest.raises(ValueError, match="No data loaded"):
+            merge_datasets_tool([e1.name])
 
 
 class TestSecurityAndUtils:
