@@ -13,11 +13,18 @@ from soup_mcp.tools import (
     convert_dataset_tool,
     dedup_dataset_tool,
     detect_dataset_tool,
+    diff_datasets_tool,
+    estimate_vram_tool,
+    generate_config_tool,
     inspect_dataset_tool,
+    list_formats_resource,
+    list_workspace_configs_resource,
+    list_workspace_datasets_resource,
     merge_datasets_tool,
     sample_dataset_tool,
     score_dataset_tool,
     split_dataset_tool,
+    validate_config_tool,
 )
 from soup_mcp.utils import atomic_write_text, ensure_under_cwd, resolve_soup_import
 
@@ -202,7 +209,7 @@ class TestSplitDatasetTool:
         rows = [{"instruction": f"Q{i}", "input": "", "output": f"A{i}"} for i in range(10)]
         file_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
 
-        result = split_dataset_tool(file_path.name, val=20, test=10, output_dir="splits_dir")
+        split_dataset_tool(file_path.name, val=20, test=10, output_dir="splits_dir")
         assert (sub / "data_train.jsonl").exists()
         assert (sub / "data_val.jsonl").exists()
         assert (sub / "data_test.jsonl").exists()
@@ -503,3 +510,130 @@ class TestSecurityAndUtils:
 
     def test_resolve_soup_import_runs_cleanly(self):
         resolve_soup_import()
+
+
+class TestEstimateVramTool:
+    def test_estimate_vram_quant_ordering_positive_control(self):
+        res_4bit = estimate_vram_tool("Qwen/Qwen2.5-7B-Instruct", seq_len=1024, batch_size=1, quant="4bit")
+        res_8bit = estimate_vram_tool("Qwen/Qwen2.5-7B-Instruct", seq_len=1024, batch_size=1, quant="8bit")
+        res_fp16 = estimate_vram_tool("Qwen/Qwen2.5-7B-Instruct", seq_len=1024, batch_size=1, quant="none")
+
+        assert res_4bit["status"] == "ok"
+        assert res_4bit["params_b"] == 7.0
+        assert res_4bit["total_gb"] < res_8bit["total_gb"] < res_fp16["total_gb"]
+        assert res_4bit["recommended_vram_gb"] > res_4bit["total_gb"]
+        assert "T4 / RTX 4060 Ti (16GB)" in res_4bit["gpu_fits"]
+        assert res_4bit["gpu_fits"]["T4 / RTX 4060 Ti (16GB)"] is True
+
+    @pytest.mark.parametrize("bad_kwargs,match", [
+        ({"model": "  "}, "non-empty"),
+        ({"model": "Qwen/Qwen2.5-7B", "seq_len": 0}, "seq_len must be positive"),
+        ({"model": "Qwen/Qwen2.5-7B", "batch_size": -1}, "batch_size must be positive"),
+        ({"model": "Qwen/Qwen2.5-7B", "lora_r": 0}, "lora_r must be positive"),
+        ({"model": "Qwen/Qwen2.5-7B", "quant": "2bit"}, "Unsupported quant"),
+        ({"model": "Qwen/Qwen2.5-7B", "peft": "ia3"}, "Unsupported peft"),
+    ])
+    def test_estimate_vram_rejects_invalid_inputs(self, bad_kwargs, match):
+        with pytest.raises(ValueError, match=match):
+            estimate_vram_tool(**bad_kwargs)
+
+
+class TestConfigGenerationAndValidation:
+    def test_generate_and_validate_config_roundtrip(self, sample_alpaca_dataset):
+        gen = generate_config_tool(
+            data_path=sample_alpaca_dataset.name,
+            model="Qwen/Qwen2.5-1.5B-Instruct",
+            goal="chat",
+            output="soup.yaml",
+            vram_gb=16.0,
+        )
+        assert gen["status"] == "ok"
+        assert gen["dry_run"] is False
+        assert gen["output_file"] == "soup.yaml"
+        assert Path("soup.yaml").exists()
+
+        val = validate_config_tool("soup.yaml")
+        assert val["status"] == "valid"
+        assert val["base"] == "Qwen/Qwen2.5-1.5B-Instruct"
+        assert val["task"] == "sft"
+        assert val["train_data"] == sample_alpaca_dataset.name
+
+    def test_generate_config_dry_run_writes_nothing(self, sample_alpaca_dataset):
+        gen = generate_config_tool(
+            data_path=sample_alpaca_dataset.name,
+            model="Qwen/Qwen2.5-3B-Instruct",
+            goal="code",
+            output="should_not_exist.yaml",
+            dry_run=True,
+        )
+        assert gen["status"] == "ok"
+        assert gen["dry_run"] is True
+        assert gen["output_file"] is None
+        assert "base:" in gen["yaml_preview"]
+        assert not Path("should_not_exist.yaml").exists()
+
+    def test_validate_config_reports_invalid_yaml(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        bad_cfg = tmp_path / "bad_soup.yaml"
+        bad_cfg.write_text("base: ''\ntraining:\n  epochs: -5\n", encoding="utf-8")
+        res = validate_config_tool("bad_soup.yaml")
+        assert res["status"] == "invalid"
+        assert len(res["errors"]) >= 1
+
+    def test_validate_config_missing_and_traversal(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(FileNotFoundError):
+            validate_config_tool("missing.yaml")
+        with pytest.raises(ValueError, match="Path traversal rejected"):
+            validate_config_tool("../outside.yaml")
+
+
+class TestDiffDatasetsTool:
+    def test_diff_datasets_detects_exact_leakage(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        train_rows = [
+            {"instruction": f"Q{i}", "input": "", "output": f"A{i}"}
+            for i in range(1, 5)
+        ]
+        # Share row Q2 and Q3 with eval split
+        eval_rows = [
+            {"instruction": "Q2", "input": "", "output": "A2"},
+            {"instruction": "Q3", "input": "", "output": "A3"},
+            {"instruction": "Q99", "input": "", "output": "A99"},
+        ]
+        (tmp_path / "train.jsonl").write_text("\n".join(json.dumps(r) for r in train_rows) + "\n", encoding="utf-8")
+        (tmp_path / "eval.jsonl").write_text("\n".join(json.dumps(r) for r in eval_rows) + "\n", encoding="utf-8")
+
+        res = diff_datasets_tool("train.jsonl", "eval.jsonl")
+        assert res["status"] == "ok"
+        assert res["rows_a"] == 4
+        assert res["rows_b"] == 3
+        assert res["overlap_count"] == 2
+        assert res["only_in_a"] == 2
+        assert res["only_in_b"] == 1
+        assert res["leakage_detected"] is True
+        assert res["overlap_pct_of_b"] == 66.67
+
+    def test_diff_datasets_disjoint_no_leakage(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "a.jsonl").write_text(json.dumps({"instruction": "A", "input": "", "output": "1"}) + "\n", encoding="utf-8")
+        (tmp_path / "b.jsonl").write_text(json.dumps({"instruction": "B", "input": "", "output": "2"}) + "\n", encoding="utf-8")
+
+        res = diff_datasets_tool("a.jsonl", "b.jsonl")
+        assert res["overlap_count"] == 0
+        assert res["leakage_detected"] is False
+
+
+class TestWorkspaceResources:
+    def test_list_formats_resource(self):
+        fmts = list_formats_resource()
+        assert "alpaca" in fmts["valid_formats"]
+        assert "sharegpt" in fmts["convertible_formats"]
+        assert "chatml" in fmts["schemas"]
+
+    def test_workspace_discovery_resources(self, sample_alpaca_dataset):
+        (sample_alpaca_dataset.parent / "soup.yaml").write_text("base: test\n", encoding="utf-8")
+        ds = list_workspace_datasets_resource()
+        cfgs = list_workspace_configs_resource()
+        assert any(d["path"] == sample_alpaca_dataset.name for d in ds["datasets"])
+        assert any(c["path"] == "soup.yaml" for c in cfgs["configs"])

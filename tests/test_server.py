@@ -38,16 +38,25 @@ def test_server_lists_all_nine_tools():
         "soup_convert_format",
         "soup_merge_datasets",
         "soup_score_dataset",
+        "soup_estimate_vram",
+        "soup_validate_config",
+        "soup_generate_config",
+        "soup_diff_datasets",
     }
     assert expected.issubset(tool_names)
+
+    by_name = {t.name: t for t in tools}
+    assert getattr(by_name["soup_inspect_dataset"].annotations, "read_only_hint", None) is True
+    assert getattr(by_name["soup_estimate_vram"].annotations, "read_only_hint", None) is True
+    assert getattr(by_name["soup_clean_dataset"].annotations, "read_only_hint", None) is False
+    assert getattr(by_name["soup_generate_config"].annotations, "destructive_hint", None) is False
 
 
 def test_server_lists_prompts():
     server = mcp_mod.server
     prompts = asyncio.run(server.list_prompts())
     prompt_names = {p.name for p in prompts}
-    assert "audit_dataset" in prompt_names
-    assert "prepare_dataset" in prompt_names
+    assert {"audit_dataset", "prepare_dataset", "plan_finetune", "check_data_leakage"}.issubset(prompt_names)
 
 
 def test_get_audit_prompt():
@@ -184,3 +193,69 @@ def test_call_tool_score_dataset(mcp_test_env):
     data = result.structured_content.get("result", result.structured_content)
     assert data["status"] == "ok"
     assert data["total_rows"] == 10
+
+
+def test_server_resources_and_new_tools(mcp_test_env):
+    server = mcp_mod.server
+
+    # List & read resources
+    resources = asyncio.run(server.list_resources())
+    uris = {str(r.uri) for r in resources}
+    assert {"soup://formats", "soup://workspace/datasets", "soup://workspace/configs"}.issubset(uris)
+
+    fmt_contents = asyncio.run(server.read_resource("soup://formats"))
+    fmt_items = getattr(fmt_contents, "contents", fmt_contents)
+    assert "alpaca" in fmt_items[0].content
+
+    ds_contents = asyncio.run(server.read_resource("soup://workspace/datasets"))
+    ds_items = getattr(ds_contents, "contents", ds_contents)
+    assert mcp_test_env.name in ds_items[0].content
+
+    # Estimate VRAM tool
+    vram_res = asyncio.run(
+        server.call_tool(
+            "soup_estimate_vram",
+            {"model": "Qwen/Qwen2.5-7B-Instruct", "quant": "4bit", "seq_len": 1024},
+        )
+    )
+    assert vram_res.is_error is False
+    vram_data = vram_res.structured_content.get("result", vram_res.structured_content)
+    assert vram_data["status"] == "ok"
+    assert vram_data["total_gb"] > 0
+
+    # Generate & validate config tools
+    gen_res = asyncio.run(
+        server.call_tool(
+            "soup_generate_config",
+            {
+                "data_path": mcp_test_env.name,
+                "model": "Qwen/Qwen2.5-1.5B-Instruct",
+                "output": "soup.yaml",
+            },
+        )
+    )
+    assert gen_res.is_error is False
+    assert Path("soup.yaml").exists()
+
+    val_res = asyncio.run(server.call_tool("soup_validate_config", {"path": "soup.yaml"}))
+    assert val_res.is_error is False
+    val_data = val_res.structured_content.get("result", val_res.structured_content)
+    assert val_data["status"] == "valid"
+
+    # Diff datasets tool
+    diff_res = asyncio.run(
+        server.call_tool(
+            "soup_diff_datasets",
+            {"path_a": mcp_test_env.name, "path_b": mcp_test_env.name},
+        )
+    )
+    assert diff_res.is_error is False
+    diff_data = diff_res.structured_content.get("result", diff_res.structured_content)
+    assert diff_data["overlap_count"] == 10
+    assert diff_data["leakage_detected"] is True
+
+    # New prompts
+    plan_p = asyncio.run(
+        server.get_prompt("plan_finetune", {"dataset_path": "train.jsonl", "model": "Qwen/Qwen2.5-7B"})
+    )
+    assert "soup_estimate_vram" in plan_p.messages[0].content.text

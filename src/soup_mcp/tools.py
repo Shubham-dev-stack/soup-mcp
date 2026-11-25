@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import io
 import json
 import random
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 from soup_mcp.utils import atomic_write_text, ensure_under_cwd, resolve_soup_import
 
@@ -459,4 +464,281 @@ def merge_datasets_tool(
         "total_rows": len(all_rows),
         "input_files": file_counts,
         "shuffled": shuffle,
+    }
+
+
+_SUPPORTED_QUANTS = ("none", "4bit", "8bit", "fp8", "gptq", "awq")
+_SUPPORTED_PEFT = ("lora", "none")
+_GPU_TIERS_GB = {
+    "T4 / RTX 4060 Ti (16GB)": 16.0,
+    "RTX 3090 / 4090 / L4 (24GB)": 24.0,
+    "A100 (40GB)": 40.0,
+    "A100 / H100 (80GB)": 80.0,
+}
+
+
+def estimate_vram_tool(
+    model: str,
+    seq_len: int = 2048,
+    batch_size: int = 1,
+    quant: str = "4bit",
+    peft: str = "lora",
+    lora_r: int = 64,
+    optimizer: str = "adamw_bnb_8bit",
+    gradient_checkpointing: bool = True,
+    allow_network: bool = False,
+) -> dict[str, Any]:
+    """Estimate peak training VRAM and GPU tier compatibility using Soup's VRAM model."""
+    if not model or not model.strip():
+        raise ValueError("model must be a non-empty model name or path.")
+    if seq_len <= 0:
+        raise ValueError(f"seq_len must be positive, got {seq_len}")
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be positive, got {batch_size}")
+    if lora_r <= 0:
+        raise ValueError(f"lora_r must be positive, got {lora_r}")
+    if quant not in _SUPPORTED_QUANTS:
+        raise ValueError(f"Unsupported quant '{quant}'. Supported: {', '.join(_SUPPORTED_QUANTS)}")
+    if peft not in _SUPPORTED_PEFT:
+        raise ValueError(f"Unsupported peft '{peft}'. Supported: {', '.join(_SUPPORTED_PEFT)}")
+
+    from soup_cli.utils.model_shape import read_model_shape
+    from soup_cli.utils.vram_estimate import (
+        GB,
+        VRAM_SAFETY_MARGIN,
+        RunSpec,
+        estimate_vram,
+    )
+
+    shape = read_model_shape(model.strip(), allow_network=allow_network)
+    run = RunSpec(
+        seq_len=seq_len,
+        batch_size=batch_size,
+        quant=quant,
+        peft=peft,
+        lora_r=lora_r,
+        optimizer=optimizer,
+        gradient_checkpointing=gradient_checkpointing,
+    )
+    est = estimate_vram(shape, run)
+    total_gb = round(est.total_gb, 3)
+    recommended_gb = round(est.total_gb * (1.0 + VRAM_SAFETY_MARGIN), 3)
+    breakdown_gb = {
+        term: round(val / GB, 3)
+        for term, val in est.terms.items()
+        if val > 0
+    }
+    gpu_fits = {tier: recommended_gb <= cap for tier, cap in _GPU_TIERS_GB.items()}
+
+    return {
+        "status": "ok",
+        "model": model.strip(),
+        "params_b": round(shape.params / 1e9, 3),
+        "shape_source": shape.shape_source,
+        "quant": quant,
+        "peft": peft,
+        "seq_len": seq_len,
+        "batch_size": batch_size,
+        "total_gb": total_gb,
+        "recommended_vram_gb": recommended_gb,
+        "breakdown_gb": breakdown_gb,
+        "gpu_fits": gpu_fits,
+        "notes": list(est.notes),
+    }
+
+
+def validate_config_tool(path: str) -> dict[str, Any]:
+    """Validate a soup.yaml training configuration against Soup's Pydantic schema."""
+    file_path = ensure_under_cwd(path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+    from soup_cli.config.loader import load_config
+
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            cfg = load_config(file_path)
+    except (Exception, SystemExit) as exc:
+        output_text = buf.getvalue().strip()
+        lines = [line.strip() for line in output_text.splitlines() if line.strip()]
+        if not lines:
+            lines = [str(exc)]
+        return {
+            "status": "invalid",
+            "file": file_path.name,
+            "errors": lines,
+        }
+
+    t = cfg.training
+    return {
+        "status": "valid",
+        "file": file_path.name,
+        "base": cfg.base,
+        "task": cfg.task,
+        "backend": cfg.backend,
+        "quantization": t.quantization,
+        "lora_r": t.lora.r,
+        "epochs": t.epochs,
+        "lr": t.lr,
+        "batch_size": t.batch_size,
+        "gradient_accumulation_steps": t.gradient_accumulation_steps,
+        "max_length": cfg.data.max_length,
+        "train_data": cfg.data.train,
+    }
+
+
+def generate_config_tool(
+    data_path: str,
+    model: str,
+    goal: str = "chat",
+    output: str = "soup.yaml",
+    vram_gb: float | None = None,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Generate a tailored soup.yaml training config via Soup Autopilot."""
+    in_path = ensure_under_cwd(data_path)
+    if not in_path.exists():
+        raise FileNotFoundError(f"File not found: {data_path}")
+    if not model or not model.strip():
+        raise ValueError("model must be a non-empty model name or path.")
+    if vram_gb is not None and vram_gb <= 0:
+        raise ValueError(f"vram_gb must be positive, got {vram_gb}")
+
+    from soup_cli.autopilot import build_soup_config
+
+    cfg = build_soup_config(
+        model=model.strip(),
+        data_path=str(in_path),
+        goal=goal,
+        vram_gb=vram_gb,
+    )
+    # Keep data.train relative to CWD for portable configs
+    cwd = Path.cwd().resolve()
+    try:
+        cfg.data.train = str(in_path.resolve().relative_to(cwd)).replace("\\", "/")
+    except ValueError:
+        pass
+
+    data = cfg.model_dump(mode="json", exclude_none=True)
+    yaml_text = yaml.safe_dump(data, sort_keys=False)
+
+    out_file_str: str | None = None
+    if not dry_run:
+        out_path = ensure_under_cwd(output)
+        if out_path.resolve() == in_path.resolve():
+            raise ValueError("Output path cannot match input data path.")
+        atomic_write_text(yaml_text, out_path)
+        out_file_str = out_path.name
+
+    return {
+        "status": "ok",
+        "dry_run": dry_run,
+        "output_file": out_file_str,
+        "task": cfg.task,
+        "base": cfg.base,
+        "quantization": cfg.training.quantization,
+        "yaml_preview": yaml_text,
+    }
+
+
+def _row_digest(row: dict[str, Any]) -> str:
+    canonical = json.dumps(row, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def diff_datasets_tool(path_a: str, path_b: str) -> dict[str, Any]:
+    """Compare two datasets for exact row overlap (train/val leakage) and format parity."""
+    file_a = ensure_under_cwd(path_a)
+    file_b = ensure_under_cwd(path_b)
+    if not file_a.exists():
+        raise FileNotFoundError(f"File not found: {path_a}")
+    if not file_b.exists():
+        raise FileNotFoundError(f"File not found: {path_b}")
+
+    rows_a = load_raw_data(file_a)
+    rows_b = load_raw_data(file_b)
+
+    def _safe_fmt(rows: list[dict[str, Any]]) -> str:
+        if not rows:
+            return "empty"
+        try:
+            return detect_format(rows)
+        except Exception:
+            return "custom"
+
+    digests_a = {_row_digest(r) for r in rows_a}
+    digests_b = {_row_digest(r) for r in rows_b}
+    overlap = digests_a & digests_b
+
+    return {
+        "status": "ok",
+        "file_a": file_a.name,
+        "file_b": file_b.name,
+        "format_a": _safe_fmt(rows_a),
+        "format_b": _safe_fmt(rows_b),
+        "rows_a": len(rows_a),
+        "rows_b": len(rows_b),
+        "unique_a": len(digests_a),
+        "unique_b": len(digests_b),
+        "overlap_count": len(overlap),
+        "overlap_pct_of_b": round((len(overlap) / len(digests_b)) * 100.0, 2) if digests_b else 0.0,
+        "only_in_a": len(digests_a - digests_b),
+        "only_in_b": len(digests_b - digests_a),
+        "leakage_detected": len(overlap) > 0,
+    }
+
+
+_IGNORED_DIRS = {".git", "node_modules", ".venv", "__pycache__", ".pytest_cache", ".ruff_cache"}
+
+
+def _scan_workspace_files(extensions: tuple[str, ...], max_depth: int = 3) -> list[dict[str, Any]]:
+    cwd = Path.cwd().resolve()
+    found: list[dict[str, Any]] = []
+    for item in cwd.rglob("*"):
+        if any(part in _IGNORED_DIRS for part in item.parts):
+            continue
+        if not item.is_file() or item.suffix.lower() not in extensions:
+            continue
+        try:
+            rel = item.resolve().relative_to(cwd)
+        except ValueError:
+            continue
+        if len(rel.parts) > max_depth:
+            continue
+        found.append({
+            "path": str(rel).replace("\\", "/"),
+            "size_bytes": item.stat().st_size,
+        })
+    found.sort(key=lambda x: x["path"])
+    return found
+
+
+def list_formats_resource() -> dict[str, Any]:
+    """Return supported Soup dataset formats and convertible targets."""
+    return {
+        "valid_formats": sorted(VALID_FORMATS),
+        "convertible_formats": sorted(CONVERTIBLE_FORMATS),
+        "schemas": {
+            "alpaca": ["instruction", "input (optional)", "output"],
+            "sharegpt": ["conversations: [{from: human|gpt|system, value: str}]"],
+            "chatml": ["messages: [{role: system|user|assistant, content: str}]"],
+            "dpo": ["prompt", "chosen", "rejected"],
+        },
+    }
+
+
+def list_workspace_datasets_resource() -> dict[str, Any]:
+    """Discover dataset files under the current working directory."""
+    return {
+        "cwd": Path.cwd().name,
+        "datasets": _scan_workspace_files((".jsonl", ".json", ".parquet", ".csv")),
+    }
+
+
+def list_workspace_configs_resource() -> dict[str, Any]:
+    """Discover YAML configuration files under the current working directory."""
+    return {
+        "cwd": Path.cwd().name,
+        "configs": _scan_workspace_files((".yaml", ".yml")),
     }

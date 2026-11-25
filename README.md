@@ -20,19 +20,33 @@ When AI engineers fine-tune local models in modern AI IDEs, data preparation is 
 
 ---
 
-## Available MCP Tools (9 Core Tools)
+## Available MCP Tools (13 Tools with `ToolAnnotations`)
+
+Every tool includes MCP `ToolAnnotations` (`readOnlyHint`, `destructiveHint`, `idempotentHint`) so clients like Cursor, Claude Code, and Antigravity can safely auto-approve read-only operations.
 
 | Tool | Type | Description |
 | :--- | :--- | :--- |
 | `soup_inspect_dataset` | Read-only | Analyzes format validity, row counts, token length distributions, empty fields, duplicates, and issues. |
 | `soup_detect_format` | Read-only | Detects schema format (`alpaca`, `sharegpt`, `chatml`, `dpo`, etc.) and column structure. |
 | `soup_score_dataset` | Read-only | Evaluates dataset for PII (emails/phones), toxic keywords, language distribution, and educational value. |
+| `soup_diff_datasets` | Read-only | Compares two datasets for exact row overlap (train/val leakage detection) and format parity. |
+| `soup_estimate_vram` | Read-only | Estimates peak training VRAM breakdown (weights, adapters, optimizer, activations, overhead) and GPU fit (T4/4090/A100/H100). |
+| `soup_validate_config` | Read-only | Validates a `soup.yaml` training config against Soup's Pydantic schema and returns resolved hyperparameters or exact errors. |
 | `soup_clean_dataset` | Safe Mutating | Sanitizes control characters, strips AI disclaimers, repairs unclosed markdown fences, and fixes JSON syntax. |
 | `soup_dedup_dataset` | Safe Mutating | Drops exact and field-level duplicates with preserved row order. |
 | `soup_sample_dataset` | Safe Mutating | Deterministic random subset sampling by count or percentage with seed. |
 | `soup_split_dataset` | Safe Mutating | Deterministic train/validation/test partitioning with reproducible pseudorandom seeds. |
 | `soup_convert_format` | Safe Mutating | Lossless format conversion between Alpaca, ShareGPT, and ChatML. |
 | `soup_merge_datasets` | Safe Mutating | Merges multiple JSONL dataset files into a single unified file. |
+| `soup_generate_config` | Safe Mutating | Generates a tailored `soup.yaml` via Soup Autopilot from dataset profile, model, goal, and optional VRAM budget. |
+
+---
+
+## MCP Resources (Live Workspace Context)
+
+- **`soup://formats`**: Supported Soup dataset formats (`alpaca`, `sharegpt`, `chatml`, `dpo`) and field schemas.
+- **`soup://workspace/datasets`**: Auto-discovers `.jsonl`, `.json`, `.parquet`, and `.csv` dataset files under CWD.
+- **`soup://workspace/configs`**: Auto-discovers `.yaml` / `.yml` configuration files under CWD.
 
 ---
 
@@ -40,7 +54,9 @@ When AI engineers fine-tune local models in modern AI IDEs, data preparation is 
 
 `soup-mcp` includes interactive prompts that AI assistants can load:
 - **`audit_dataset`**: Guides the AI to run inspection, format detection, and scoring tools to generate an exhaustive dataset health report.
-- **`prepare_dataset`**: Guides the AI through the complete preparation recipe: inspection -> cleaning -> deduplication -> format conversion -> train/val splitting.
+- **`prepare_dataset`**: Guides the AI through the complete preparation recipe: inspection -> cleaning -> deduplication -> format conversion -> train/val splitting -> leakage check.
+- **`plan_finetune`**: Plans a VRAM-safe fine-tuning run, checks GPU fit with `soup_estimate_vram`, generates `soup.yaml` via Autopilot, and validates it.
+- **`check_data_leakage`**: Runs `soup_diff_datasets` across train/eval splits to guarantee 0% contamination.
 
 ---
 

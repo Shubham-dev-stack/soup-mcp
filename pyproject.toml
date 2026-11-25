@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "soup-mcp"
-version = "0.1.0"
-description = "Model Context Protocol (MCP) server for Soup: dataset intelligence, cleaning, splitting, conversion, and validation."
+version = "0.2.0"
+description = "Model Context Protocol (MCP) server for Soup: dataset intelligence, leakage diffing, VRAM estimation, Autopilot config generation, and validation."
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
@@ -13,6 +13,7 @@ authors = [
 ]
 dependencies = [
     "mcp>=1.0.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
