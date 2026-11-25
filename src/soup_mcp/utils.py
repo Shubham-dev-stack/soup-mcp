@@ -6,7 +6,6 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any
 
 
 def resolve_soup_import() -> None:
